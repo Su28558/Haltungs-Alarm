@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Haltungs‑Alarm (Safari‑kompatibel)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>html,body{height:100%;background:#0a0a0a}</style>
+  <!-- TensorFlow + Pose Detection (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <!-- MediaPipe Pose for BlazePose runtime -->
+  <script>window.MEDIAPIPE_POSE_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/pose";</script>
+</head>
+<body class="text-zinc-100">
+  <div class="max-w-5xl mx-auto p-4">
+    <header class="flex items-center gap-3 mb-4">
+      <h1 class="text-2xl font-semibold">Haltungs‑Alarm</h1>
+      <span id="status" class="text-sm px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800">Bereit</span>
+      <span class="text-xs text-zinc-400">Safari‑optimiert</span>
+    </header>
+
+    <div class="grid md:grid-cols-2 gap-6">
+      <section class="rounded-2xl border border-zinc-800 bg-zinc-950 overflow-hidden">
+        <div class="p-3 flex flex-wrap gap-2 items-center">
+          <button id="startBtn" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 font-medium">Start</button>
+          <button id="stopBtn" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 font-medium hidden">Stop</button>
+          <button id="calBtn" class="px-4 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 font-medium border border-zinc-800" disabled>Kalibrieren (aufrecht)</button>
+          <label class="text-sm">Kamera:
+            <select id="device" class="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-1 min-w-[14rem]"></select>
+          </label>
+          <label class="text-sm ml-auto flex items-center gap-2">
+            <input type="checkbox" id="flipChk" class="accent-zinc-200" checked>
+            Spiegeln
+          </label>
+        </div>
+        <div class="relative">
+          <canvas id="canvas" class="w-full h-auto block"></canvas>
+          <video id="video" class="hidden" autoplay muted playsinline></video>
+        </div>
+        <div class="p-3 border-t border-zinc-800">
+          <pre id="log" class="text-xs bg-zinc-900/70 border border-zinc-800 rounded-xl p-3 overflow-auto max-h-40"></pre>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-zinc-800 bg-zinc-950 p-4 space-y-6">
+        <div>
+          <div class="mb-2 text-sm text-zinc-300">Empfindlichkeit</div>
+          <input id="sens" type="range" min="0" max="100" value="60" class="w-full"/>
+          <div class="flex justify-between text-xs text-zinc-400"><span>Locker</span><span>Streng</span></div>
+        </div>
+        <div>
+          <div class="mb-2 text-sm text-zinc-300">Lautstärke</div>
+          <input id="vol" type="range" min="0" max="1" step="0.01" value="0.9" class="w-full"/>
+        </div>
+        <div>
+          <div class="mb-2 text-sm text-zinc-300">Cooldown zwischen Signalen (Sek.)</div>
+          <input id="cool" type="range" min="0" max="20" step="1" value="5" class="w-full"/>
+          <div class="text-xs text-zinc-400 mt-1"><span id="coolLbl">5</span>s</div>
+        </div>
+        <div>
+          <div class="mb-2 text-sm text-zinc-300">Erkennungsrate (FPS)</div>
+          <input id="fps" type="range" min="5" max="30" step="1" value="12" class="w-full"/>
+          <div class="text-xs text-zinc-400 mt-1"><span id="fpsLbl">12</span> fps</div>
+        </div>
+        <div class="text-sm text-zinc-300 leading-relaxed">
+          <p class="mb-2 font-medium">Hinweise</p>
+          <ul class="list-disc pl-5 space-y-2">
+            <li>Seite muss über <b>https://</b> laufen (Netlify ok). Kamera in Safari erlauben.</li>
+            <li>Nach Start aufrecht hinsetzen und <b>Kalibrieren</b>.</li>
+            <li>Wenn kein Ton: Lautstärke hier erhöhen und Tab aktiv halten.</li>
+          </ul>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const calBtn = document.getElementById('calBtn');
+    const deviceSel = document.getElementById('device');
+    const flipChk = document.getElementById('flipChk');
+    const sens = document.getElementById('sens');
+    const vol = document.getElementById('vol');
+    const cool = document.getElementById('cool');
+    const coolLbl = document.getElementById('coolLbl');
+    const fps = document.getElementById('fps');
+    const fpsLbl = document.getElementById('fpsLbl');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+
+    let running=false, detector=null, rafId=null, lastTime=0, lastBeepAt=0, calibrated=false;
+    let baseline={ neckAngle:null, torsoAngle:null, fhd:null };
+    let stream=null, audioCtx=null;
+
+    cool.addEventListener('input', ()=> coolLbl.textContent = cool.value);
+    fps.addEventListener('input', ()=> fpsLbl.textContent = fps.value);
+
+    function log(msg){ logEl.textContent += msg+"\n"; logEl.scrollTop = logEl.scrollHeight; console.log(msg);}
+    function setStatus(s){ statusEl.textContent = s; }
+    function lerp(a,b,t){ return a+(b-a)*t; }
+    function thresholds(){ const t=Number(sens.value)/100; return { neckDeg:lerp(12,6,t), torsoDeg:lerp(10,5,t), fhdRatio:lerp(0.45,0.22,t) }; }
+
+    async function listDevices(){
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d=> d.kind==='videoinput');
+      deviceSel.innerHTML='';
+      cams.forEach((c,i)=>{ const opt=document.createElement('option'); opt.value=c.deviceId; opt.textContent=c.label||`Kamera ${i+1}`; deviceSel.appendChild(opt); });
+      if(!cams.length){ log('Keine Kameras gefunden.'); setStatus('Keine Kamera gefunden'); }
+    }
+
+    async function openCamera(deviceId){
+      // Safari mag einfache Constraints
+      const constraints = deviceId ? { video:{ deviceId:{ exact:deviceId } }, audio:false } : { video:true, audio:false };
+      log('Öffne Kamera…');
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.setAttribute('playsinline',''); video.setAttribute('autoplay',''); video.setAttribute('muted','');
+      video.srcObject = stream;
+      await new Promise(res=>{ if(video.readyState>=1) res(); else video.onloadedmetadata = ()=> res(); });
+      await video.play();
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      log(`Video: ${video.videoWidth}×${video.videoHeight}`);
+    }
+
+    function closeCamera(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } video.srcObject=null; }
+
+    function beep(ms=450){
+      const now=performance.now(); if(now-lastBeepAt < Number(cool.value)*1000) return;
+      if(!audioCtx) return; const osc=audioCtx.createOscillator(); const gain=audioCtx.createGain();
+      osc.type='square'; osc.frequency.value=880; gain.gain.value=0.0001;
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      const t0=audioCtx.currentTime, target=Math.max(0.0001, Math.min(1, Number(vol.value)));
+      gain.gain.setValueAtTime(0.0001,t0); gain.gain.exponentialRampToValueAtTime(target,t0+0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001,t0+ms/1000); osc.start(); osc.stop(t0+ms/1000+0.05);
+      lastBeepAt=now;
+    }
+
+    function computeMetrics(keypoints){
+      const by=(n,min=0.3)=> keypoints.find(k=> (k.name||k.part)===n && (k.score==null || k.score>=min));
+      const ls=by('left_shoulder'), rs=by('right_shoulder'), lh=by('left_hip'), rh=by('right_hip'), nose=by('nose');
+      const mid=(a,b)=> a&&b? {x:(a.x+b.x)/2, y:(a.y+b.y)/2}:null; const dist=(a,b)=> Math.hypot(a.x-b.x,a.y-b.y);
+      const ms=mid(ls,rs), mh=mid(lh,rh); const shoulderWidth=(ls&&rs)? dist(ls,rs):null; let torsoAngle=0, neckAngle=0, fhd=0;
+      if(ms && mh){ const vx=mh.x-ms.x, vy=mh.y-ms.y; torsoAngle=Math.abs(Math.atan2(vx,vy)*180/Math.PI); }
+      if(ms && nose){ const vx=nose.x-ms.x, vy=nose.y-ms.y; neckAngle=Math.abs(Math.atan2(vx,vy)*180/Math.PI); }
+      if(ms && nose && shoulderWidth){ fhd=Math.abs(nose.x-ms.x)/(shoulderWidth||1); }
+      return { neckAngle, torsoAngle, fhd };
+    }
+
+    function drawSkeleton(ctx, keypoints, flip){
+      const pts={}; keypoints.forEach(k=> pts[k.name||k.part]=k);
+      ctx.save(); if(flip){ ctx.translate(ctx.canvas.width,0); ctx.scale(-1,1); }
+      ctx.lineWidth=4; ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.fillStyle='rgba(59,130,246,0.9)';
+      const j=n=> pts[n] && (pts[n].score==null || pts[n].score>0.3); const p=n=> pts[n];
+      function line(a,b){ if(!j(a)||!j(b)) return; ctx.beginPath(); ctx.moveTo(p(a).x,p(a).y); ctx.lineTo(p(b).x,p(b).y); ctx.stroke(); }
+      line('left_shoulder','right_shoulder'); line('left_hip','right_hip'); line('left_shoulder','left_elbow'); line('right_shoulder','right_elbow');
+      line('left_elbow','left_wrist'); line('right_elbow','right_wrist'); line('left_shoulder','left_hip'); line('right_shoulder','right_hip');
+      line('left_hip','left_knee'); line('right_hip','right_knee');
+      Object.values(pts).forEach(k=>{ if(k.score!=null && k.score<0.3) return; ctx.beginPath(); ctx.arc(k.x,k.y,5,0,Math.PI*2); ctx.fill(); });
+      ctx.restore();
+    }
+
+    let lastMetrics={ neckAngle:0, torsoAngle:0, fhd:0 };
+
+    async function loop(){
+      const flip=!!flipChk.checked; const intervalMs = 1000/Math.max(1, Number(fps.value));
+      async function tick(t){ if(!running) return; rafId=requestAnimationFrame(tick); if(t-lastTime<intervalMs) return; lastTime=t;
+        try{
+          const poses = await poseDetectionBlaze(video, flip);
+          ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
+          if(flip){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
+          ctx.drawImage(video,0,0,canvas.width,canvas.height); ctx.restore();
+          if(poses && poses[0] && poses[0].keypoints){
+            const kp = poses[0].keypoints; const m=computeMetrics(kp); lastMetrics=m;
+            const th=thresholds();
+            let ok=false; if(calibrated && baseline.neckAngle!=null){
+              const dn=Math.max(0,m.neckAngle-baseline.neckAngle); const dt=Math.max(0,m.torsoAngle-baseline.torsoAngle); const df=Math.max(0,m.fhd-baseline.fhd);
+              ok = dn<th.neckDeg && dt<th.torsoDeg && df<th.fhdRatio;
+            } else { ok = m.torsoAngle<12 && m.neckAngle<14 && m.fhd<0.5; }
+            drawSkeleton(ctx, kp, flip);
+            if(ok){ setStatus(calibrated? 'Haltung ok':'Bitte kalibrieren'); } else { setStatus('Krumm erkannt – Signal'); beep(); }
+          } else { setStatus('Keine Person erkannt'); }
+        } catch(err){ setStatus('Fehler bei Erkennung'); log('Loop‑Fehler: '+err); }
+      }
+      rafId=requestAnimationFrame(tick);
+    }
+
+    async function poseDetectionBlaze(video, flip){
+      if(!detector){
+        try{ await tf.ready(); }catch{}
+        try{ await tf.setBackend('webgl'); }catch{}
+        detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+          runtime:'mediapipe', solutionPath: window.MEDIAPIPE_POSE_PATH, modelType:'full', enableSmoothing:true
+        });
+      }
+      return detector.estimatePoses(video, { flipHorizontal: !!flip });
+    }
+
+    async function start(){
+      try{
+        // unlock audio
+        if(!audioCtx){ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); const o=audioCtx.createOscillator(), g=audioCtx.createGain(); g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.02); }
+        // open camera (first time without deviceId to get permission + labels)
+        await openCamera(); await listDevices();
+        running=true; calibrated=false; baseline={neckAngle:null,torsoAngle:null,fhd:null}; calBtn.disabled=false;
+        startBtn.classList.add('hidden'); stopBtn.classList.remove('hidden'); setStatus('Läuft');
+        loop();
+      } catch(err){ setStatus('Kamera nicht verfügbar'); log('Start‑Fehler: '+err.name+' – '+err.message); }
+    }
+
+    function stop(){ running=false; cancelAnimationFrame(rafId); closeCamera(); setStatus('Angehalten'); startBtn.classList.remove('hidden'); stopBtn.classList.add('hidden'); calBtn.disabled=true; }
+
+    function calibrate(){ const duration=800, samples=[]; const t0=performance.now();
+      function sample(){ if(lastMetrics && isFinite(lastMetrics.neckAngle) && isFinite(lastMetrics.torsoAngle) && isFinite(lastMetrics.fhd)) samples.push(lastMetrics);
+        if(performance.now()-t0<duration) requestAnimationFrame(sample); else if(samples.length){ baseline={ neckAngle:avg(samples.map(s=>s.neckAngle)), torsoAngle:avg(samples.map(s=>s.torsoAngle)), fhd:avg(samples.map(s=>s.fhd)) }; calibrated=true; setStatus('Kalibriert'); } }
+      sample(); }
+
+    function avg(a){ return a.reduce((x,y)=>x+y,0)/a.length; }
+
+    // UI
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    calBtn.addEventListener('click', calibrate);
+    deviceSel.addEventListener('change', async ()=>{ try{ closeCamera(); await openCamera(deviceSel.value); }catch(err){ log('Gerätewechsel‑Fehler: '+err); } });
+
+    // Hinweis bei nicht‑https
+    if(location.protocol!=='https:' && location.hostname!=='localhost') log('Warnung: Nicht‑HTTPS. Kamera funktioniert nur über https:// oder http://localhost.');
+  </script>
+
+  <noscript><div class="max-w-xl mx-auto mt-10 p-4 rounded-xl bg-zinc-900 border border-zinc-800">Bitte JavaScript aktivieren.</div></noscript>
+</body>
+</html>
