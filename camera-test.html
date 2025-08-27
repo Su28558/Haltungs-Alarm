@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Kamera-Test</title></head>
+<body>
+<button id="start">Start</button> <button id="stop">Stop</button>
+<select id="device"></select>
+<video id="v" playsinline autoplay muted style="width:100%;max-width:800px;background:#000"></video>
+<pre id="log" style="white-space:pre-wrap"></pre>
+<script>
+const v=document.getElementById('v'), L=document.getElementById('log');
+let s=null; const log=t=>{L.textContent+=t+"\\n";};
+async function list(){const d=await navigator.mediaDevices.enumerateDevices();
+  const cams=d.filter(x=>x.kind==='videoinput'); const sel=document.getElementById('device');
+  sel.innerHTML=''; cams.forEach((c,i)=>{const o=document.createElement('option');o.value=c.deviceId;o.textContent=c.label||('Kamera '+(i+1)); sel.appendChild(o);});
+}
+async function open(id){ try{
+  s=await navigator.mediaDevices.getUserMedia(id?{video:{deviceId:{exact:id}},audio:false}:{video:true,audio:false});
+  v.srcObject=s; await new Promise(r=>{ if(v.readyState>=1) r(); else v.onloadedmetadata=r; }); await v.play(); log('OK '+v.videoWidth+'×'+v.videoHeight);
+} catch(e){ log(e.name+': '+e.message); } }
+function stop(){ if(s){ s.getTracks().forEach(t=>t.stop()); s=null; v.srcObject=null; }
+}
+document.getElementById('start').onclick=async()=>{ await open(); await list(); };
+document.getElementById('stop').onclick=stop;
+document.getElementById('device').onchange=async e=>{ stop(); await open(e.target.value); };
+</script></body></html>
