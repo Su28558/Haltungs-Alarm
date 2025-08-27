@@ -6,12 +6,31 @@
   <title>Haltungs‑Alarm (Safari‑kompatibel)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>html,body{height:100%;background:#0a0a0a}</style>
-  <!-- TensorFlow + Pose Detection (UMD) -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
-  <!-- MediaPipe Pose for BlazePose runtime -->
-  <script>window.MEDIAPIPE_POSE_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/pose";</script>
+  <!-- TensorFlow + Pose Detection (UMD) – 2 CDNs, wir laden fallback-weise -->
+<script>
+  (function(){
+    function add(src, onload){ var s=document.createElement('script'); s.src=src; s.onload=onload; s.onerror=onload; document.head.appendChild(s); }
+    // Lade tfjs-core, backend-webgl, pose-detection nacheinander, erst jsDelivr, dann unpkg als Fallback
+    function loadSeq(urls, cb){ if(!urls.length) return cb(); add(urls.shift(), ()=> loadSeq(urls, cb)); }
+    window.__loadPoseLibs = function(cb){
+      loadSeq([
+        'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core',
+        'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl',
+        'https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection'
+      ], function(){
+        if(window.poseDetection) return cb();
+        // Fallback: unpkg
+        loadSeq([
+          'https://unpkg.com/@tensorflow/tfjs-core',
+          'https://unpkg.com/@tensorflow/tfjs-backend-webgl',
+          'https://unpkg.com/@tensorflow-models/pose-detection'
+        ], cb);
+      });
+    };
+  })();
+</script>
+<!-- MediaPipe Pose for BlazePose runtime -->
+<script>window.MEDIAPIPE_POSE_PATH = 'https://cdn.jsdelivr.net/npm/@mediapipe/pose';</script>
 </head>
 <body class="text-zinc-100">
   <div class="max-w-5xl mx-auto p-4">
@@ -170,46 +189,61 @@
       const flip=!!flipChk.checked; const intervalMs = 1000/Math.max(1, Number(fps.value));
       async function tick(t){ if(!running) return; rafId=requestAnimationFrame(tick); if(t-lastTime<intervalMs) return; lastTime=t;
         try{
-          const poses = await poseDetectionBlaze(video, flip);
+          // Zeichne IMMER erst das Videobild, damit man sofort etwas sieht, auch wenn Pose noch lädt
           ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
           if(flip){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
           ctx.drawImage(video,0,0,canvas.width,canvas.height); ctx.restore();
+
+          let poses=null;
+          try{ poses = await poseDetectionBlaze(video, flip); }
+          catch(loadErr){ setStatus('Läuft (ohne Pose – Lade Bibliotheken)'); log('Pose-Load: '+loadErr); return; }
+
           if(poses && poses[0] && poses[0].keypoints){
             const kp = poses[0].keypoints; const m=computeMetrics(kp); lastMetrics=m;
-            const th=thresholds();
-            let ok=false; if(calibrated && baseline.neckAngle!=null){
+            const th=thresholds(); let ok=false;
+            if(calibrated && baseline.neckAngle!=null){
               const dn=Math.max(0,m.neckAngle-baseline.neckAngle); const dt=Math.max(0,m.torsoAngle-baseline.torsoAngle); const df=Math.max(0,m.fhd-baseline.fhd);
               ok = dn<th.neckDeg && dt<th.torsoDeg && df<th.fhdRatio;
             } else { ok = m.torsoAngle<12 && m.neckAngle<14 && m.fhd<0.5; }
             drawSkeleton(ctx, kp, flip);
             if(ok){ setStatus(calibrated? 'Haltung ok':'Bitte kalibrieren'); } else { setStatus('Krumm erkannt – Signal'); beep(); }
-          } else { setStatus('Keine Person erkannt'); }
+          } else {
+            setStatus('Person/Keypoints noch nicht erfasst…');
+          }
+        } catch(err){ setStatus('Fehler bei Erkennung'); log('Loop‑Fehler: '+err); }
+      }
+      rafId=requestAnimationFrame(tick);
+    } else { setStatus('Keine Person erkannt'); }
         } catch(err){ setStatus('Fehler bei Erkennung'); log('Loop‑Fehler: '+err); }
       }
       rafId=requestAnimationFrame(tick);
     }
 
     async function poseDetectionBlaze(video, flip){
+      if(!window.poseDetection){
+        await new Promise((res)=> __loadPoseLibs(res));
+      }
+      // Falls tfjs nicht initialisiert ist, trotzdem versuchen weiterzumachen
+      try{ if(window.tf && !tf.getBackend()) { try{ await tf.setBackend('webgl'); }catch{} } }catch{}
       if(!detector){
-        try{ await tf.ready(); }catch{}
-        try{ await tf.setBackend('webgl'); }catch{}
-        detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
-          runtime:'mediapipe', solutionPath: window.MEDIAPIPE_POSE_PATH, modelType:'full', enableSmoothing:true
-        });
+        try{
+          if(window.tf){ try{ await tf.ready(); }catch{} }
+          detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+            // Versuche zuerst MediaPipe (performant)
+            runtime:'mediapipe', solutionPath: window.MEDIAPIPE_POSE_PATH, modelType:'full', enableSmoothing:true
+          });
+        } catch(e){
+          // Fallback: reines TFJS-Runtime (langsamer, aber ohne MediaPipe-Abhängigkeit)
+          try{
+            detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+              runtime:'tfjs', modelType:'lite', enableSmoothing:true
+            });
+          } catch(e2){
+            throw new Error('Pose-Detector konnte nicht geladen werden: '+(e2&&e2.message||e.message));
+          }
+        }
       }
       return detector.estimatePoses(video, { flipHorizontal: !!flip });
-    }
-
-    async function start(){
-      try{
-        // unlock audio
-        if(!audioCtx){ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); const o=audioCtx.createOscillator(), g=audioCtx.createGain(); g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.02); }
-        // open camera (first time without deviceId to get permission + labels)
-        await openCamera(); await listDevices();
-        running=true; calibrated=false; baseline={neckAngle:null,torsoAngle:null,fhd:null}; calBtn.disabled=false;
-        startBtn.classList.add('hidden'); stopBtn.classList.remove('hidden'); setStatus('Läuft');
-        loop();
-      } catch(err){ setStatus('Kamera nicht verfügbar'); log('Start‑Fehler: '+err.name+' – '+err.message); }
     }
 
     function stop(){ running=false; cancelAnimationFrame(rafId); closeCamera(); setStatus('Angehalten'); startBtn.classList.remove('hidden'); stopBtn.classList.add('hidden'); calBtn.disabled=true; }
